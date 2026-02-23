@@ -7,7 +7,7 @@
 DHT_Unified dht(DHTPIN, DHTTYPE);
 uint32_t delayMS;
 
-String comandoRecebido = "";
+String receivedCommand = "";
 
 void setup()
 {
@@ -16,34 +16,15 @@ void setup()
   Serial.println("Inicializando sensor DHT");
   sensor_t sensor;
   dht.temperature().getSensor(&sensor);
-  Serial.println("------------------------------------");
-  Serial.println("Temperatura");
-  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
-  Serial.print  ("Valor max:    "); Serial.print(sensor.max_value); Serial.println(" *C");
-  Serial.print  ("Valor min:    "); Serial.print(sensor.min_value); Serial.println(" *C");
-  Serial.print  ("Resolucao:   "); Serial.print(sensor.resolution); Serial.println(" *C");
-  Serial.println("------------------------------------");
-  dht.humidity().getSensor(&sensor);
-  Serial.println("------------------------------------");
-  Serial.println("Umidade");
-  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
-  Serial.print  ("Valor max:    "); Serial.print(sensor.max_value); Serial.println("%");
-  Serial.print  ("Valor min:    "); Serial.print(sensor.min_value); Serial.println("%");
-  Serial.print  ("Resolucao:   "); Serial.print(sensor.resolution); Serial.println("%");
-  Serial.println("------------------------------------");
   delayMS = sensor.min_delay / 1000;
 }
 
 void loop()
 {
-  delay(delayMS);
-  float T, H;
-  leituraSensores(T, H);
-  Serial.print("T:");   Serial.print(T);
-  Serial.print(";U:");  Serial.println(H);
+  getCommands();
 }
 
-void leituraSensores(float &temperture, float &humidity) {
+void sensorsRead(float &temperture, float &humidity) {
   sensors_event_t event;
 
   dht.temperature().getEvent(&event);
@@ -62,5 +43,39 @@ void leituraSensores(float &temperture, float &humidity) {
   } else
   {
   humidity = event.relative_humidity;
+  }
+}
+
+void getCommands()
+{
+  while (Serial.available() > 0)
+  {
+    char character = Serial.read();
+
+    if (character == '\r')
+    {
+      executeCommand(receivedCommand);
+      receivedCommand = "";
+    }
+    else if (character != '\n')
+    {
+      receivedCommand += character;
+    }
+  }
+}
+
+void executeCommand(String command)
+{
+  command.trim();
+
+  if (command == "Send 1")
+  {
+    float t = 0.0;
+    float h = 0.0;
+
+    sensorsRead(t, h);
+
+    Serial.print("T:");   Serial.print(t);
+    Serial.print(";H:");  Serial.println(h);
   }
 }
