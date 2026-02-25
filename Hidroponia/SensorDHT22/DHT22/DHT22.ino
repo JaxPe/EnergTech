@@ -1,18 +1,24 @@
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
+#include <SoftwareSerial.h>
 
 #define DHTTYPE DHT22
 #define DHTPIN 2
 DHT_Unified dht(DHTPIN, DHTTYPE);
 uint32_t delayMS;
 
+SoftwareSerial masterSerial(5, 6);
+
 String receivedCommand = "";
+const String ID = "1";  // alterar ID aqui
 
 void setup()
 {
   Serial.begin(9600);
+  masterSerial.begin(9600);
   dht.begin();
+
   Serial.println("Inicializando sensor DHT");
   sensor_t sensor;
   dht.temperature().getSensor(&sensor);
@@ -48,9 +54,9 @@ void sensorsRead(float &temperture, float &humidity) {
 
 void getCommands()
 {
-  while (Serial.available() > 0)
+  while (masterSerial.available() > 0)
   {
-    char character = Serial.read();
+    char character = masterSerial.read();
 
     if (character == '\r')
     {
@@ -66,16 +72,17 @@ void getCommands()
 
 void executeCommand(String command)
 {
+  String target = "Send " + ID;
   command.trim();
 
-  if (command == "Send 1")
+  if (command == target)
   {
     float t = 0.0;
     float h = 0.0;
 
     sensorsRead(t, h);
 
-    Serial.print("T:");   Serial.print(t);
-    Serial.print(";H:");  Serial.println(h);
+    masterSerial.print("T:");   masterSerial.print(t);
+    masterSerial.print(";H:");  masterSerial.println(h);
   }
 }
