@@ -8,14 +8,12 @@ const long responseInterval = 1000;
 
 const int totalSlaves = 2;
 int currentSlave = 1;
-
 bool awaitingResponse = false;
 
 void setup()
 {
   Serial.begin(9600);
   slaveSerial.begin(9600);
-
   Serial.println("Master Inicializado");
 }
 
@@ -39,14 +37,12 @@ void loop()
   {
     awaitingResponse = false;
     Serial.print("[RESPONSE] ");
-
     while (slaveSerial.available() > 0)
     {
       char responseChar = slaveSerial.read();
       Serial.print(responseChar);
       delay(2);
     }
-
     prepareNextSlave();
   }
 
@@ -55,7 +51,6 @@ void loop()
     Serial.print("[TIMEOUT] Slave ");
     Serial.print(currentSlave);
     Serial.println(" failed to respond!");
-
     awaitingResponse = false;
     prepareNextSlave();
   }
