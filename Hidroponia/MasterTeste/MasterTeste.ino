@@ -2,9 +2,9 @@
 
 SoftwareSerial slaveSerial(5, 6);
 
-unsigned long lastCommandTime = 0;
+unsigned long lastActionTime = 0;
 const long pollingInterval = 2000;
-const long responseInterval = 1000;
+const long responseTimeout = 1000;
 
 const int totalSlaves = 2;
 int currentSlave = 1;
@@ -19,46 +19,76 @@ void setup()
 
 void loop()
 {
-  if (!awaitingResponse && (millis() - lastCommandTime >= pollingInterval))
+  unsigned long currentTime = millis();
+
+  if (!awaitingResponse && (currentTime - lastActionTime >= pollingInterval))
   {
-    lastCommandTime = millis();
-    awaitingResponse = true;
-
-    Serial.print("\n[MASTER] Requesting data -> 'Send ");
-    Serial.print(currentSlave);
-    Serial.println("<CR>'");
-
-    slaveSerial.print("Send ");
-    slaveSerial.print(currentSlave);
-    slaveSerial.println("\r");
+    sendRequest();
   }
-
-  if (slaveSerial.available() > 0)
+  if (awaitingResponse && slaveSerial.available() > 0)
   {
-    awaitingResponse = false;
-    Serial.print("[RESPONSE] ");
-    while (slaveSerial.available() > 0)
-    {
-      char responseChar = slaveSerial.read();
-      Serial.print(responseChar);
-      delay(2);
-    }
-    prepareNextSlave();
+    handleResponse();
   }
-
-  if (awaitingResponse && (millis() - lastCommandTime >= responseInterval))
+  if (awaitingResponse && (currentTime - lastActionTime >= responseTimeout))
   {
-    Serial.print("[TIMEOUT] Slave ");
-    Serial.print(currentSlave);
-    Serial.println(" failed to respond!");
-    awaitingResponse = false;
-    prepareNextSlave();
+    handleTimeout();
   }
 }
 
-void prepareNextSlave()
+void sendRequest()
 {
+  lastActionTime = millis();
+  awaitingResponse = true;
+
+  Serial.print("\n[POLLING] Slave ");
+  Serial.print(currentSlave);
+
+  slaveSerial.print("Send ");
+  slaveSerial.print(currentSlave);
+  slaveSerial.print("\r");
+}
+
+void handleResponse()
+{
+  String rawData = slaveSerial.readStringUntil('\n');
+  rawData.trim();
+
+  int rxId;
+  float rxTemp, rxHum;
+
+  int fields = sscanf(rawData.c_str(), "%d,%f,%f", &rxId, &rxTemp, &rxHum);
+
+  if (fields == 3 && rxId == currentSlave)
+  {
+    Serial.print(" -> SUCCESS: ");
+    Serial.print("T:");
+    Serial.print(rxTemp);
+    Serial.print(" H:");
+    Serial.println(rxHum);
+  }
+  else
+  {
+    Serial.print(" -> DATA ERROR: Received invalid format or wrong ID: ");
+    Serial.println(rawData);
+  }
+
+  finishCycle();
+}
+
+void handleTimeout()
+{
+  Serial.println(" -> TIMEOUT: Slave failed to respond.");
+  finishCycle();
+}
+
+void finishCycle()
+{
+  awaitingResponse = false;
+  lastActionTime = millis();
+
   currentSlave++;
   if (currentSlave > totalSlaves)
+  {
     currentSlave = 1;
+  }
 }
