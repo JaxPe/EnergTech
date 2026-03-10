@@ -1,16 +1,22 @@
 #include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
 #include <SoftwareSerial.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
-#define DHTTYPE DHT22
-#define DHTPIN 2
 #define ADDR_BIT0 A1
 #define ADDR_BIT1 A2
 #define ADDR_BIT2 A3
 #define ADDR_BIT3 A4
+#define ONE_WIRE_BUS 2
+#define FLOW_SWITCH 3
 
-DHT_Unified dht(DHTPIN, DHTTYPE);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensor(&oneWire);
+DeviceAddress tempDeviceAddress;
+
+unsigned long flowStartTime = 0;
+bool isMonitoringFlow = 0;
+unsigned long finalFlowDuration = 0;
 
 int _device_id = 0; // alterar ID aqui
 SoftwareSerial masterSerial(5, 6);
@@ -23,11 +29,11 @@ void setup()
   pinMode(A3, INPUT_PULLUP);
   pinMode(A4, INPUT_PULLUP);
 
+  sensor.begin();
   Serial.begin(9600);
   masterSerial.begin(9600);
 
-  dht.begin();
-  _device_id = readAdressFromPins()
+  _device_id = readAdressFromPins();
 }
 
 void loop()
@@ -65,47 +71,54 @@ void getCommands()
 void executeCommand(String command)
 {
   command.trim();
-  String target = "Send " + _device_id;
+  String sendCommand = "Send " + _device_id;
+  String startCommand = "Start All";
 
-  if (command == target)
+  if (command == sendCommand)
   {
     float t = 0.0;
-    float h = 0.0;
 
-    sensorsRead(t, h);
+    temperatureRead(t);
+    flowRead();
 
     masterSerial.print("Slave ");
     masterSerial.print(_device_id);
     masterSerial.print(",");
     masterSerial.print(t);
     masterSerial.print(",");
-    masterSerial.println(h);
+    masterSerial.print(isMonitoringFlow);
+    masterSerial.print(",");
+    masterSerial.println(finalFlowDuration);
+  }
+  if (command == startCommand)
+  {
+    flowStartTime = millis();
+    isMonitoringFlow = true;
+    finalFlowDuration = 0;
   }
 }
 
-void sensorsRead(float &temperture, float &humidity)
+void flowRead()
 {
-  sensors_event_t event;
+  if (!isMonitoringFlow)
+    return;
 
-  dht.temperature().getEvent(&event);
-
-  if (isnan(event.temperature))
+  if (digitalRead(FLOW_SWITCH) == LOW)
   {
-    temperture = -99.0;
+    finalFlowDuration = millis() - flowStartTime;
+    isMonitoringFlow = false;
+  }
+}
+
+void temperatureRead(float &temperature)
+{
+  sensor.requestTemperatures();
+  if (!sensor.getAddress(tempDeviceAddress, 0))
+  {
+    temperature = -99.0;
   }
   else
   {
-    temperture = event.temperature;
-  }
-
-  dht.humidity().getEvent(&event);
-
-  if (isnan(event.relative_humidity))
-  {
-    humidity = -99.0;
-  }
-  else
-  {
-    humidity = event.relative_humidity;
+    temperature = sensor.getTempC(tempDeviceAddress);
   }
 }
