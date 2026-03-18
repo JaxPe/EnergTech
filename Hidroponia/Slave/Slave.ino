@@ -1,124 +1,460 @@
-#include <Adafruit_Sensor.h>
+// ============================================================
+//  SLAVE
+//  Hardware: Arduino NANO
+//  Rev: C  |  Date: 2026-03-11
+//
+//  MAPEAMENTO DE CONEXÕES (apartir da esquemática V6):
+//    D2  (05) - OneWire DS18B20 sensor temperatura
+//    D3  (06) - FLT 1
+//    D4  (07) - FLT 2
+//    D5  (08) - FLT 3
+//    D6  (09) - FLT 4
+//    D7  (10) - FLT 5
+//    D8  (11) - FLT 6
+//    D9  (12) - FLT 7
+//    D10 (13) - FLT 8
+//    D11 (14) - FLT 9
+//    A0  (19) - ENDEREÇO bit 0
+//    A1  (20) - ENDEREÇO bit 1
+//    A2  (21) - ENDEREÇO bit 2
+//    A3  (22) - ENDEREÇO bit 3
+//    A4  (23) - ENDEREÇO bit 4
+//    A5  (24) - MODO DE OPERAÇÃO (open=full, shorted=temp only)
+//    TX  (01) - conversor RS485 TXD
+//    RX  (02) - conversor RS485 RXD
+//
+//  MODOS OPERACIONAIS (DIP switch A5 / MOD OP):
+//    0 = Full: medição de vazão (9 flautas) + temperatura
+//    1 = Somente temperatura
+//
+//  COMMANDS (RS485 bus, <CR> terminated):
+//    R A<CR>           - ALL devices run their flow measurement routine
+//    SEND <addr><CR>   - Device at <addr> sends temperature + flow data
+//    Tmax <val><CR>    - Set max flow measurement window (ms)
+//    Tmin <val><CR>    - Set min acceptable flow time (ms)
+//    TRATE <val><CR>   - Set temperature samples per minute (default 12)
+//
+//  RESPONSE to "SEND <addr>":
+//    <temp>,<clog_HEX>,<flow_HEX><CR><LF>
+//    Example:  22.50,01FF,0000
+//
+//    clog_HEX (16-bit):
+//      Bit position = flauta number (0=FLT1 ... 8=FLT9)
+//      Bit 0 = CLOGGED purge outlet
+//      Bit 1 = purge outlet OK
+//
+//    flow_HEX (16-bit):
+//      Bit position = flauta number (0=FLT1 ... 8=FLT9)
+//      Bit 1 = LOW FLOW (did not trigger within Tmax)
+//      Bit 0 = flow OK
+//
+//  TEMPERATURE:
+//    Sampled continuously in the background at TRATE per minute.
+//    Moving average of last 10 valid readings.
+//    Readings deviating more than 2 deg C from current
+//    average are discarded. Completely independent of flow routine.
+// ============================================================
+
 #include <SoftwareSerial.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#define ADDR_BIT0 A1
-#define ADDR_BIT1 A2
-#define ADDR_BIT2 A3
-#define ADDR_BIT3 A4
-#define ONE_WIRE_BUS 2
-#define FLOW_SWITCH 3
+// ==== Pin definitions ========================
+#define TEMP_PIN 2
+#define FLT_FIRST_PIN 3
+#define NUM_FLAUTAS 1
 
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensor(&oneWire);
-DeviceAddress tempDeviceAddress;
+#define ADDR_PIN_0 A0
+#define ADDR_PIN_1 A1
+#define ADDR_PIN_2 A2
+#define ADDR_PIN_3 A3
+#define ADDR_PIN_4 A4
+#define MODE_PIN A5
 
-unsigned long flowStartTime = 0;
+// ==== Default timing (ms) ====================
+#define DEFAULT_TMAX 2000
+#define DEFAULT_TMIN 500
+
+// ==== Temperature moving average =============
+#define DEFAULT_TRATE 12 // leituras por minuto
+#define TEMP_AVG_SIZE 10
+#define TEMP_MAX_DELTA 2.0f // °C - descarta leituras fora desta margem
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+DeviceAddress tempAddress;
+
+int _device_id = 0;
+int _op_mode = 0; // 0=completo, 1=temp somente
+
+unsigned long _tmax = DEFAULT_TMAX;
+unsigned long _tmin = DEFAULT_TMIN;
+unsigned long _trate = DEFAULT_TRATE;
+
+unsigned long _tempSampleInterval = 60000UL / DEFAULT_TRATE;
+unsigned long _lastTempSample = 0;
+
+// Resultado de medições
+float _temperature = -99.0;
+uint16_t _clog_status = 0xFFFF;
+uint16_t _flow_status = 0x0000;
+bool _measurement_done = false;
+
+// Vazão
+enum FLowState
+{
+  FLOW_IDLE,
+  FLOW_CLOG_CHECK,
+  FLOW_RUNNING,
+  FLOW_DONE
+};
+FLowState _flowState = FLOW_IDLE;
+unsigned long _flowStartTime = 0;
+bool _flowPinDone[NUM_FLAUTAS] = {false};
+bool _flowClogged[NUM_FLAUTAS] = {false};
+unsigned long _flowSwitchTime[NUM_FLAUTAS] = {0};
+
+float _tempBuffer[TEMP_AVG_SIZE];
+int _tempIndex = 0;
+int _tempCount = 0;
+
+String _rxBuffer = "";
+
 bool isMonitoringFlow = 0;
 unsigned long finalFlowDuration = 0;
 
-int _device_id = 0; // alterar ID aqui
+float tempAdj = 0.0;
+
 SoftwareSerial masterSerial(5, 6);
-String receivedCommand = "";
 
 void setup()
 {
-  pinMode(A1, INPUT_PULLUP);
-  pinMode(A2, INPUT_PULLUP);
-  pinMode(A3, INPUT_PULLUP);
-  pinMode(A4, INPUT_PULLUP);
+  pinMode(ADDR_PIN_0, INPUT_PULLUP);
+  pinMode(ADDR_PIN_1, INPUT_PULLUP);
+  pinMode(ADDR_PIN_2, INPUT_PULLUP);
+  pinMode(ADDR_PIN_3, INPUT_PULLUP);
+  pinMode(ADDR_PIN_4, INPUT_PULLUP);
+  pinMode(MODE_PIN, INPUT_PULLUP);
 
-  sensor.begin();
+  for (int i = 0; i < NUM_FLAUTAS; i++)
+  {
+    pinMode(FLT_FIRST_PIN + i, INPUT_PULLUP);
+  }
+
+  tempSensor.begin();
   Serial.begin(9600);
   masterSerial.begin(9600);
 
-  _device_id = readAdressFromPins();
+  _device_id = readAddress();
+  _op_mode = !digitalRead(MODE_PIN);
+
+  initTemperatureBuffer();
 }
 
 void loop()
 {
-  getCommands();
+  readSerialCommands();
 }
 
-int readAdressFromPins()
+// Lê endereço 5-bit do DIP switch (A0-A4)
+int readAddress()
 {
-  int b0 = !digitalRead(ADDR_BIT0);
-  int b1 = !digitalRead(ADDR_BIT1);
-  int b2 = !digitalRead(ADDR_BIT2);
-  int b3 = !digitalRead(ADDR_BIT3);
-
-  return (b0 * 1) + (b1 * 2) + (b2 * 4) + (b3 * 8);
+  int b0 = !digitalRead(ADDR_PIN_0);
+  int b1 = !digitalRead(ADDR_PIN_1);
+  int b2 = !digitalRead(ADDR_PIN_2);
+  int b3 = !digitalRead(ADDR_PIN_3);
+  int b4 = !digitalRead(ADDR_PIN_4);
+  return b0 + (b1 << 1) + (b2 << 2) + (b3 << 3) + (b4 << 4);
 }
 
-void getCommands()
+// Acumula caracteres do RS485 até <CR>
+void readSerialCommands()
 {
   while (masterSerial.available() > 0)
   {
-    char character = masterSerial.read();
-    if (character == '\r')
+    char c = (char)masterSerial.read();
+    if (c == '\r')
     {
-      executeCommand(receivedCommand);
-      receivedCommand = "";
+      _rxBuffer.trim();
+      if (_rxBuffer.length() > 0)
+      {
+        handleCommand(_rxBuffer);
+      }
+      _rxBuffer = "";
     }
-    else if (character != '\n')
+    else if (c != '\n')
     {
-      receivedCommand += character;
+      _rxBuffer += c;
     }
   }
 }
 
-void executeCommand(String command)
+void handleCommand(String cmd)
 {
-  command.trim();
-  String sendCommand = "Send " + _device_id;
-  String startCommand = "Start All";
-
-  if (command == sendCommand)
+  if (cmd == "READ A")
   {
-    float t = 0.0;
-
-    temperatureRead(t);
-    flowRead();
-
-    masterSerial.print("Slave ");
-    masterSerial.print(_device_id);
-    masterSerial.print(",");
-    masterSerial.print(t);
-    masterSerial.print(",");
-    masterSerial.print(isMonitoringFlow);
-    masterSerial.print(",");
-    masterSerial.println(finalFlowDuration);
+    startMeasurement();
   }
-  if (command == startCommand)
+  else if (cmd.startsWith("SEND "))
   {
-    flowStartTime = millis();
-    isMonitoringFlow = true;
-    finalFlowDuration = 0;
+    int addr = cmd.substring(5).toInt();
+    if (addr == _device_id)
+    {
+      sendData();
+    }
+  }
+  else if (cmd.startsWith("Tmax "))
+  {
+    _tmax = (unsigned long)cmd.substring(5).toInt();
+  }
+  else if (cmd.startsWith("Tmin "))
+  {
+    _tmin = (unsigned long)cmd.substring(5).toInt();
+  }
+  else if (cmd.startsWith("TRATE "))
+  {
+    unsigned long rate = (unsigned long)cmd.substring(6).toInt();
+    if (rate > 0)
+    {
+      _trate = rate;
+      _tempSampleInterval = 60000UL / _trate;
+    }
   }
 }
 
-void flowRead()
+void startMeasurement()
 {
-  if (!isMonitoringFlow)
+  _clog_status = 0xFFFF;
+  _flow_status = 0x0000;
+  _measurement_done = false;
+
+  for (int i = 0; i < NUM_FLAUTAS; i++)
+  {
+    _flowPinDone[i] = false;
+    _flowClogged[i] = false;
+    _flowSwitchTime[i] = 0;
+  }
+
+  _flowState = FLOW_CLOG_CHECK;
+}
+
+void runFlowStateMachine()
+{
+  switch (_flowState)
+  {
+  case FLOW_IDLE:
+    break;
+  case FLOW_CLOG_CHECK:
+  {
+    int clogCount = 0;
+    for (int i = 0; i < NUM_FLAUTAS; i++)
+    {
+      if (digitalRead(FLT_FIRST_PIN + i) == LOW)
+      {
+        _flowPinDone[i] = true;
+        _flowClogged[i] = true;
+        clogCount++;
+        _clog_status &= ~(1 << i); // bit=0 → entupido
+      }
+    }
+
+    if (clogCount == NUM_FLAUTAS)
+    {
+      _flow_status = 0x01FF;
+      _measurement_done = true;
+      _flowState = FLOW_IDLE;
+    }
+    else if (_op_mode == 1)
+    {
+      _measurement_done = true;
+      _flowState = FLOW_IDLE;
+    }
+    else
+    {
+      _flowStartTime = millis();
+      _flowState = FLOW_RUNNING;
+    }
+    break;
+  }
+
+  case FLOW_RUNNING:
+  {
+    unsigned long elapsed = millis() - _flowStartTime;
+    bool allDone = true;
+
+    for (int i = 0; i < NUM_FLAUTAS; i++)
+    {
+      if (!_flowPinDone[i])
+      {
+        if (digitalRead(FLT_FIRST_PIN + i) == LOW)
+        {
+          _flowSwitchTime[i] = elapsed;
+          _flowPinDone[i] = true;
+        }
+        else
+        {
+          allDone = false;
+        }
+      }
+    }
+
+    if (allDone || elapsed >= _tmax)
+    {
+      _flowState = FLOW_DONE;
+    }
+
+    break;
+  }
+
+  case FLOW_DONE:
+  {
+    bool anyTriggeredOK = false;
+
+    for (int i = 0; i < NUM_FLAUTAS; i++)
+    {
+      if (_flowClogged[i])
+        continue;
+
+      if (!_flowPinDone[i])
+      {
+        _flow_status |= (1 << i);
+      }
+      else if (_flowSwitchTime[i] < _tmin)
+      {
+        _flow_status |= (1 << i);
+      }
+      else
+      {
+        anyTriggeredOK = true;
+      }
+    }
+
+    if (!anyTriggeredOK)
+    {
+      _flow_status = 0x01FF;
+    }
+
+    _measurement_done = true;
+    _flowState = FLOW_IDLE;
+    break;
+  }
+  }
+}
+
+void sendData()
+{
+  if (_flowState != FLOW_IDLE)
+  {
+    Serial.print("BUSY\r\n");
     return;
-
-  if (digitalRead(FLOW_SWITCH) == LOW)
-  {
-    finalFlowDuration = millis() - flowStartTime;
-    isMonitoringFlow = false;
   }
-}
 
-void temperatureRead(float &temperature)
-{
-  sensor.requestTemperatures();
-  if (!sensor.getAddress(tempDeviceAddress, 0))
+  if (!_measurement_done)
   {
-    temperature = -99.0;
+    Serial.print("NODATA\r\n");
+  }
+
+  if (_temperature <= -98.0)
+  {
+    Serial.print("ERR");
   }
   else
   {
-    temperature = sensor.getTempC(tempDeviceAddress);
+    Serial.print(_temperature, 1);
   }
+
+  char buf[5];
+  Serial.print(",");
+  sprintf(buf, "%04x", _clog_status);
+  Serial.print(buf);
+
+  Serial.print(",");
+  sprintf(buf, "%04x", _flow_status);
+  Serial.print(buf);
+
+  Serial.print("\r\n");
+}
+
+void sampleTemperatureContinuous()
+{
+  unsigned long now = millis();
+  if (now - _lastTempSample >= _tempSampleInterval)
+  {
+    _lastTempSample = now;
+    updateTemperature();
+  }
+}
+
+void updateTemperature()
+{
+  tempSensor.requestTemperatures();
+
+  if (!tempSensor.getAddress(tempAddress, 0))
+  {
+    _temperature = -99.0;
+    return;
+  }
+
+  float reading = tempSensor.getTempC(tempAddress);
+
+  if (reading == DEVICE_DISCONNECTED_C)
+  {
+    _temperature = -99.0;
+    return;
+  }
+
+  if (_tempCount > 0)
+  {
+    float avg = computeAverage();
+    if (fabsf(reading - avg) > TEMP_MAX_DELTA)
+    {
+      return;
+    }
+  }
+
+  _tempBuffer[_tempIndex] = reading;
+  _tempIndex = (_tempIndex + 1) % TEMP_AVG_SIZE;
+  if (_tempCount < TEMP_AVG_SIZE)
+  {
+    _tempCount++;
+  }
+  _temperature = computeAverage();
+}
+
+float computeAverage()
+{
+  if (_tempCount == 0)
+  {
+    return 0.0;
+  }
+  float sum = 0.0;
+  for (int i = 0; i < _tempCount; i++)
+  {
+    sum += _tempBuffer[i];
+  }
+  return sum / _tempCount;
+}
+
+void initTemperatureBuffer()
+{
+  tempSensor.requestTemperatures();
+
+  if (!tempSensor.getAddress(tempAddress, 0))
+  {
+    return;
+  }
+
+  float first = tempSensor.getTempC(tempAddress);
+  if (first == DEVICE_DISCONNECTED_C)
+  {
+    return;
+  }
+  for (int i = 0; i < TEMP_AVG_SIZE; i++)
+  {
+    _tempBuffer[i] = first;
+  }
+
+  _tempCount = TEMP_AVG_SIZE;
+  _tempIndex = 0;
+  _temperature = first;
 }
