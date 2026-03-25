@@ -27,39 +27,39 @@
 //    0 = Full: medição de vazão (9 flautas) + temperatura
 //    1 = Somente temperatura
 //
-//  COMMANDS (RS485 bus, <CR> terminated):
-//    R A<CR>           - ALL devices run their flow measurement routine
-//    SEND <addr><CR>   - Device at <addr> sends temperature + flow data
-//    Tmax <val><CR>    - Set max flow measurement window (ms)
-//    Tmin <val><CR>    - Set min acceptable flow time (ms)
-//    TRATE <val><CR>   - Set temperature samples per minute (default 12)
+//  COMANDOS (RS485 bus, <CR>):
+//    READ A<CR>        - TODOS os dispositivos executam a rotina de medição de vazão
+//    SEND <addr><CR>   - dispositivo <addr> envia temperatura + flow data
+//    Tmax <val><CR>    - Define janela de tempo máxima para medição de vazão (ms)
+//    Tmin <val><CR>    - Define tempo mínimo para vazão (ms)
+//    TRATE <val><CR>   - Define amostras de temperatura por minuto (padrão = 12)
 //
-//  RESPONSE to "SEND <addr>":
-//    <temp>,<clog_HEX>,<flow_HEX><CR><LF>
+//  RESPOSTA para "SEND <addr>":
+//    <temperatura>,<obstruido_HEX>,<vazao_HEX><CR><LF>
 //    Example:  22.50,01FF,0000
 //
-//    clog_HEX (16-bit):
-//      Bit position = flauta number (0=FLT1 ... 8=FLT9)
-//      Bit 0 = CLOGGED purge outlet
-//      Bit 1 = purge outlet OK
+//    obstruido_HEX (16-bit):
+//      posição do Bit = número da flauta (0=FLT1 ... 8=FLT9)
+//      Bit 0 = saída OBSTRUIDA
+//      Bit 1 = saída OK
 //
-//    flow_HEX (16-bit):
-//      Bit position = flauta number (0=FLT1 ... 8=FLT9)
-//      Bit 1 = LOW FLOW (did not trigger within Tmax)
-//      Bit 0 = flow OK
+//    vazao_HEX (16-bit):
+//      posição do Bit = número da flauta (0=FLT1 ... 8=FLT9)
+//      Bit 1 = vazao BAIXA (não acionou dentro do Tmax)
+//      Bit 0 = vazao OK
 //
-//  TEMPERATURE:
-//    Sampled continuously in the background at TRATE per minute.
-//    Moving average of last 10 valid readings.
-//    Readings deviating more than 2 deg C from current
-//    average are discarded. Completely independent of flow routine.
+//  TEMPERATURA:
+//    Amostras coletadas continuamente em backgroun em uma frequencia de TRATE por segundo.
+//    Média móvel das últimas 10 medições.
+//    Leituras que desviam mais que 2°C da média atual são decartadas.
+//    Completamente independente do rotina de vazão.
 // ============================================================
 
 #include <SoftwareSerial.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-// ==== Pin definitions ========================
+// ==== Definição de pins ========================
 #define TEMP_PIN 2
 #define FLT_FIRST_PIN 3
 #define NUM_FLAUTAS 1
@@ -71,7 +71,7 @@
 #define ADDR_PIN_4 A4
 #define MODE_PIN A5
 
-// ==== Default timing (ms) ====================
+// ==== Tempo padrão (ms) ====================
 #define DEFAULT_TMAX 2000
 #define DEFAULT_TMIN 500
 
