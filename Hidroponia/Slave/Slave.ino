@@ -30,8 +30,8 @@
 //  COMANDOS (RS485 bus, <CR>):
 //    READ A<CR>        - TODOS os dispositivos executam a rotina de medição de vazão
 //    SEND <addr><CR>   - dispositivo <addr> envia temperatura + flow data
-//    Tmax <val><CR>    - Define janela de tempo máxima para medição de vazão (ms)
-//    Tmin <val><CR>    - Define tempo mínimo para vazão (ms)
+//    Tmax <val><CR>    - Define janela de tempo máxima para medição de vazão (ms)  Default: 2000
+//    Tmin <val><CR>    - Define tempo mínimo para vazão (ms)                       Default: 500
 //    TRATE <val><CR>   - Define amostras de temperatura por minuto (padrão = 12)
 //
 //  RESPOSTA para "SEND <addr>":
@@ -125,8 +125,6 @@ unsigned long finalFlowDuration = 0;
 
 float tempAdj = 0.0;
 
-SoftwareSerial masterSerial(5, 6);
-
 void setup()
 {
   pinMode(ADDR_PIN_0, INPUT_PULLUP);
@@ -143,17 +141,23 @@ void setup()
 
   tempSensor.begin();
   Serial.begin(9600);
-  masterSerial.begin(9600);
 
   _device_id = readAddress();
+  Serial.print("Endereço: ");
+  Serial.println(_device_id);
   _op_mode = !digitalRead(MODE_PIN);
+  Serial.print("Modo de operação: ");
+  Serial.println(_op_mode);
 
+  Serial.println("Iniciado! Coletando amostra inicial de temperatura");
   initTemperatureBuffer();
 }
 
 void loop()
 {
   readSerialCommands();
+  runFlowStateMachine();
+  sampleTemperatureContinuous();
 }
 
 // Lê endereço 5-bit do DIP switch (A0-A4)
@@ -170,9 +174,9 @@ int readAddress()
 // Acumula caracteres do RS485 até <CR>
 void readSerialCommands()
 {
-  while (masterSerial.available() > 0)
+  while (Serial.available() > 0)
   {
-    char c = (char)masterSerial.read();
+    char c = (char)Serial.read();
     if (c == '\r')
     {
       _rxBuffer.trim();
@@ -185,6 +189,7 @@ void readSerialCommands()
     else if (c != '\n')
     {
       _rxBuffer += c;
+      Serial.println(_rxBuffer);
     }
   }
 }
@@ -193,6 +198,7 @@ void handleCommand(String cmd)
 {
   if (cmd == "READ A")
   {
+    Serial.println("READ");
     startMeasurement();
   }
   else if (cmd.startsWith("SEND "))
@@ -206,10 +212,14 @@ void handleCommand(String cmd)
   else if (cmd.startsWith("Tmax "))
   {
     _tmax = (unsigned long)cmd.substring(5).toInt();
+    Serial.print("Tmax: ");
+    Serial.println(_tmax);
   }
   else if (cmd.startsWith("Tmin "))
   {
     _tmin = (unsigned long)cmd.substring(5).toInt();
+    Serial.print("Tmin: ");
+    Serial.println(_tmin);
   }
   else if (cmd.startsWith("TRATE "))
   {
@@ -217,6 +227,8 @@ void handleCommand(String cmd)
     if (rate > 0)
     {
       _trate = rate;
+      Serial.print("TRate: ");
+      Serial.println(_trate);
       _tempSampleInterval = 60000UL / _trate;
     }
   }
@@ -251,6 +263,7 @@ void runFlowStateMachine()
     {
       if (digitalRead(FLT_FIRST_PIN + i) == LOW)
       {
+        Serial.println("entupido");
         _flowPinDone[i] = true;
         _flowClogged[i] = true;
         clogCount++;
@@ -273,6 +286,7 @@ void runFlowStateMachine()
     {
       _flowStartTime = millis();
       _flowState = FLOW_RUNNING;
+      Serial.println("sem entupimento");
     }
     break;
   }
@@ -290,6 +304,7 @@ void runFlowStateMachine()
         {
           _flowSwitchTime[i] = elapsed;
           _flowPinDone[i] = true;
+          Serial.println("ativou");
         }
         else
         {
@@ -301,6 +316,7 @@ void runFlowStateMachine()
     if (allDone || elapsed >= _tmax)
     {
       _flowState = FLOW_DONE;
+      Serial.println("tempo limite");
     }
 
     break;
@@ -321,6 +337,7 @@ void runFlowStateMachine()
       }
       else if (_flowSwitchTime[i] < _tmin)
       {
+        Serial.println("Acionado antes do tempo");
         _flow_status |= (1 << i);
       }
       else
@@ -397,12 +414,6 @@ void updateTemperature()
 
   float reading = tempSensor.getTempC(tempAddress);
 
-  if (reading == DEVICE_DISCONNECTED_C)
-  {
-    _temperature = -99.0;
-    return;
-  }
-
   if (_tempCount > 0)
   {
     float avg = computeAverage();
@@ -445,10 +456,7 @@ void initTemperatureBuffer()
   }
 
   float first = tempSensor.getTempC(tempAddress);
-  if (first == DEVICE_DISCONNECTED_C)
-  {
-    return;
-  }
+
   for (int i = 0; i < TEMP_AVG_SIZE; i++)
   {
     _tempBuffer[i] = first;
@@ -457,4 +465,5 @@ void initTemperatureBuffer()
   _tempCount = TEMP_AVG_SIZE;
   _tempIndex = 0;
   _temperature = first;
+  Serial.println(_temperature);
 }
