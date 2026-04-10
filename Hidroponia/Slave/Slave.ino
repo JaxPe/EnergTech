@@ -1,7 +1,7 @@
 // ============================================================
 //  SLAVE
 //  Hardware: Arduino NANO
-//  Rev: C  |  Date: 2026-03-11
+//  Rev: E  |  Date: 2026-03-30
 //
 //  MAPEAMENTO DE CONEXÕES (apartir da esquemática V6):
 //    D2  (05) - OneWire DS18B20 sensor temperatura
@@ -13,7 +13,7 @@
 //    D8  (11) - FLT 6
 //    D9  (12) - FLT 7
 //    D10 (13) - FLT 8
-//    D11 (14) - FLT 9
+//    D13 (14) - FLT 9
 //    A0  (19) - ENDEREÇO bit 0
 //    A1  (20) - ENDEREÇO bit 1
 //    A2  (21) - ENDEREÇO bit 2
@@ -61,8 +61,8 @@
 
 // ==== Definição de pins ========================
 #define TEMP_PIN 2
-#define FLT_FIRST_PIN 3
-#define NUM_FLAUTAS 1
+#define NUM_FLAUTAS 9
+const uint8_t FLT_PINS[NUM_FLAUTAS] = {3, 4, 5, 6, 7, 8, 9, 10, 13};
 
 #define ADDR_PIN_0 A0
 #define ADDR_PIN_1 A1
@@ -72,35 +72,55 @@
 #define MODE_PIN A5
 
 // ==== Tempo padrão (ms) ====================
-#define DEFAULT_TMAX 2000
-#define DEFAULT_TMIN 500
+#define DEFAULT_FLOW_TIME_MAX 2000
+#define DEFAULT_FLOW_TIME_MIN 500
+#define DEFAULT_PURGE_TIME_MAX 1000
+#define DEFAULT_PURGE_TIME_MIN 300
 
 // ==== Temperature moving average =============
-#define DEFAULT_TRATE 12 // leituras por minuto
+#define DEFAULT_TEMP_SAMPLE_RATE 30 // leituras por minuto
 #define TEMP_AVG_SIZE 10
 #define TEMP_MAX_DELTA 2.0f // °C - descarta leituras fora desta margem
+#define DEFAULT_TEMP_ADJ 0.0f
+
+#define STATUS_UNINIT 0xFFF
 
 OneWire oneWire(TEMP_PIN);
 DallasTemperature tempSensor(&oneWire);
 DeviceAddress tempAddress;
 
+SoftwareSerial masterSerial(12, 11);
+
 int _device_id = 0;
 int _op_mode = 0; // 0=completo, 1=temp somente
 
-unsigned long _tmax = DEFAULT_TMAX;
-unsigned long _tmin = DEFAULT_TMIN;
-unsigned long _trate = DEFAULT_TRATE;
+// Tempo de vazão
+unsigned long _flowTimeMax = DEFAULT_FLOW_TIME_MAX;
+unsigned long _flowTimeMin = DEFAULT_FLOW_TIME_MIN;
 
-unsigned long _tempSampleInterval = 60000UL / DEFAULT_TRATE;
+// Tempo de purga
+unsigned long _purgeTimeMax = DEFAULT_PURGE_TIME_MAX;
+unsigned long _purgeTimeMin = DEFAULT_PURGE_TIME_MIN;
+
+// Amostragem de temperatura
+unsigned long _tempSampleRate = DEFAULT_TEMP_SAMPLE_RATE;
+unsigned long _tempSampleInterval = 60000UL / DEFAULT_TEMP_SAMPLE_RATE;
 unsigned long _lastTempSample = 0;
 
-// Resultado de medições
+// Buffer circular de temperatura
+float _tempBuffer[TEMP_AVG_SIZE];
+int _tempIndex = 0;
+int _tempCount = 0;
 float _temperature = -99.0;
-uint16_t _clog_status = 0xFFFF;
-uint16_t _flow_status = 0x0000;
-bool _measurement_done = false;
 
-// Vazão
+float _tempAdj = DEFAULT_TEMP_ADJ;
+
+// Resultado de medições
+uint16_t _clogStatus = STATUS_UNINIT;
+uint16_t _flowStatus = STATUS_UNINIT;
+uint16_t _purgeStatus = STATUS_UNINIT;
+
+// Máquina de estado de vazão
 enum FLowState
 {
   FLOW_IDLE,
@@ -108,22 +128,33 @@ enum FLowState
   FLOW_RUNNING,
   FLOW_DONE
 };
+
 FLowState _flowState = FLOW_IDLE;
 unsigned long _flowStartTime = 0;
 bool _flowPinDone[NUM_FLAUTAS] = {false};
 bool _flowClogged[NUM_FLAUTAS] = {false};
 unsigned long _flowSwitchTime[NUM_FLAUTAS] = {0};
 
-float _tempBuffer[TEMP_AVG_SIZE];
-int _tempIndex = 0;
-int _tempCount = 0;
+// Máquina de estado da purga
+enum PurgeState
+{
+  PURGE_IDLE,
+  PURGE_RUNNING,
+  PURGE_DONE
+};
 
+PurgeState _purgeState = PURGE_IDLE;
+unsigned long _purgeStartTime = 0;
+bool _purgePinDone[NUM_FLAUTAS] = {false};
+unsigned long _purgeSwitchTime[NUM_FLAUTAS] = {0};
+
+// Buffer de serial recebido
 String _rxBuffer = "";
 
-bool isMonitoringFlow = 0;
-unsigned long finalFlowDuration = 0;
-
-float tempAdj = 0.0;
+bool isBusy()
+{
+  return _flowState != FLOW_IDLE || _purgeState != PURGE_IDLE;
+}
 
 void setup()
 {
@@ -136,11 +167,12 @@ void setup()
 
   for (int i = 0; i < NUM_FLAUTAS; i++)
   {
-    pinMode(FLT_FIRST_PIN + i, INPUT_PULLUP);
+    pinMode(FLT_PINS[i], INPUT_PULLUP);
   }
 
   tempSensor.begin();
   Serial.begin(9600);
+  masterSerial.begin(9600);
 
   _device_id = readAddress();
   Serial.print("Endereço: ");
@@ -157,17 +189,18 @@ void loop()
 {
   readSerialCommands();
   runFlowStateMachine();
+  runPurgeStateMachine();
   sampleTemperatureContinuous();
 }
 
 // Lê endereço 5-bit do DIP switch (A0-A4)
 int readAddress()
 {
-  int b0 = !digitalRead(ADDR_PIN_0);
-  int b1 = !digitalRead(ADDR_PIN_1);
+  int b0 = !digitalRead(ADDR_PIN_4);
+  int b1 = !digitalRead(ADDR_PIN_3);
   int b2 = !digitalRead(ADDR_PIN_2);
-  int b3 = !digitalRead(ADDR_PIN_3);
-  int b4 = !digitalRead(ADDR_PIN_4);
+  int b3 = !digitalRead(ADDR_PIN_1);
+  int b4 = !digitalRead(ADDR_PIN_0);
   return b0 + (b1 << 1) + (b2 << 2) + (b3 << 3) + (b4 << 4);
 }
 
@@ -191,17 +224,27 @@ void readSerialCommands()
       _rxBuffer += c;
       Serial.println(_rxBuffer);
     }
+    else if (c == '\n')
+    {
+      _rxBuffer = "";
+    }
   }
 }
 
+// lida com os comandos
 void handleCommand(String cmd)
 {
-  if (cmd == "READ A")
+  if (cmd == "StartAll")
   {
-    Serial.println("READ");
-    startMeasurement();
+    Serial.println("Start");
+    startFlowMeasurement();
   }
-  else if (cmd.startsWith("SEND "))
+  else if (cmd == "StopAll")
+  {
+    startPurgeMeasurement();
+  }
+
+  else if (cmd.startsWith("Send "))
   {
     int addr = cmd.substring(5).toInt();
     if (addr == _device_id)
@@ -209,36 +252,54 @@ void handleCommand(String cmd)
       sendData();
     }
   }
-  else if (cmd.startsWith("Tmax "))
+  else if (cmd.startsWith("TimeVMax "))
   {
-    _tmax = (unsigned long)cmd.substring(5).toInt();
+    _flowTimeMax = (unsigned long)cmd.substring(9).toInt();
     Serial.print("Tmax: ");
-    Serial.println(_tmax);
+    Serial.println(_flowTimeMax);
   }
-  else if (cmd.startsWith("Tmin "))
+  else if (cmd.startsWith("TimeVMin "))
   {
-    _tmin = (unsigned long)cmd.substring(5).toInt();
+    _flowTimeMin = (unsigned long)cmd.substring(9).toInt();
     Serial.print("Tmin: ");
-    Serial.println(_tmin);
+    Serial.println(_flowTimeMin);
   }
-  else if (cmd.startsWith("TRATE "))
+  else if (cmd.startsWith("TimePMax"))
+  {
+    _purgeTimeMax = (unsigned long)cmd.substring(9).toInt();
+  }
+  else if (cmd.startsWith("TimePMin"))
+  {
+    _purgeTimeMin = (unsigned long)cmd.substring(9).toInt();
+  }
+  else if (cmd.startsWith("TempRate "))
   {
     unsigned long rate = (unsigned long)cmd.substring(6).toInt();
     if (rate > 0)
     {
-      _trate = rate;
+      _tempSampleRate = rate;
       Serial.print("TRate: ");
-      Serial.println(_trate);
-      _tempSampleInterval = 60000UL / _trate;
+      Serial.println(_tempSampleRate);
+      _tempSampleInterval = 60000UL / _tempSampleRate;
+    }
+  }
+  else if (cmd.startsWith("TempAdj "))
+  {
+    int addr = cmd.substring(9).toInt();
+    if (addr == _device_id)
+    {
+      float adjust = (float)cmd.substring(11).toFloat();
+      _tempAdj = adjust;
     }
   }
 }
 
-void startMeasurement()
+// Inicia a medição da vazão - acionado por "StartAll".
+// Reseta entupimento + vazão e inicia a máquina de estado de vazão
+void startFlowMeasurement()
 {
-  _clog_status = 0xFFFF;
-  _flow_status = 0x0000;
-  _measurement_done = false;
+  _clogStatus = 0xFFFF;
+  _flowStatus = 0x0000;
 
   for (int i = 0; i < NUM_FLAUTAS; i++)
   {
@@ -250,6 +311,19 @@ void startMeasurement()
   _flowState = FLOW_CLOG_CHECK;
 }
 
+// ============================================================
+//  Flow state machine — called every loop().
+//
+//  FLOW_CLOG_CHECK : reads all pins once.
+//                    LOW at start = clogged outlet (bit=0 in clogStatus).
+//                    HIGH at start = outlet OK (bit=1 in clogStatus).
+//                    Aborts to FLOW_IDLE if all clogged.
+//  FLOW_RUNNING    : polls pending pins each loop() call.
+//                    Records elapsed ms when pin goes LOW.
+//                    Exits when all done or _flowTimeMax elapsed.
+//  FLOW_DONE       : evaluates results once, sets _flowStatus,
+//                    transitions to FLOW_IDLE.
+// ============================================================
 void runFlowStateMachine()
 {
   switch (_flowState)
@@ -258,28 +332,31 @@ void runFlowStateMachine()
     break;
   case FLOW_CLOG_CHECK:
   {
+    _clogStatus = 0x0000;
     int clogCount = 0;
+
     for (int i = 0; i < NUM_FLAUTAS; i++)
     {
-      if (digitalRead(FLT_FIRST_PIN + i) == LOW)
+      if (digitalRead(FLT_PINS[i]) == LOW)
       {
-        Serial.println("entupido");
         _flowPinDone[i] = true;
         _flowClogged[i] = true;
         clogCount++;
-        _clog_status &= ~(1 << i); // bit=0 → entupido
+      }
+      else
+      {
+        _clogStatus |= (1 << i);
       }
     }
 
     if (clogCount == NUM_FLAUTAS)
     {
-      _flow_status = 0x01FF;
-      _measurement_done = true;
+      _flowStatus = 0x01FF;
       _flowState = FLOW_IDLE;
     }
-    else if (_op_mode == 1)
+    else if (_op_mode == 0)
     {
-      _measurement_done = true;
+      _flowStatus = 0x0000;
       _flowState = FLOW_IDLE;
     }
     else
@@ -300,7 +377,7 @@ void runFlowStateMachine()
     {
       if (!_flowPinDone[i])
       {
-        if (digitalRead(FLT_FIRST_PIN + i) == LOW)
+        if (digitalRead(FLT_PINS[i]) == LOW)
         {
           _flowSwitchTime[i] = elapsed;
           _flowPinDone[i] = true;
@@ -313,7 +390,7 @@ void runFlowStateMachine()
       }
     }
 
-    if (allDone || elapsed >= _tmax)
+    if (allDone || elapsed >= _flowTimeMax)
     {
       _flowState = FLOW_DONE;
       Serial.println("tempo limite");
@@ -324,6 +401,7 @@ void runFlowStateMachine()
 
   case FLOW_DONE:
   {
+    _flowStatus = 0x0000;
     bool anyTriggeredOK = false;
 
     for (int i = 0; i < NUM_FLAUTAS; i++)
@@ -333,12 +411,12 @@ void runFlowStateMachine()
 
       if (!_flowPinDone[i])
       {
-        _flow_status |= (1 << i);
+        _flowStatus |= (1 << i);
       }
-      else if (_flowSwitchTime[i] < _tmin)
+      else if (_flowSwitchTime[i] < _flowTimeMin)
       {
         Serial.println("Acionado antes do tempo");
-        _flow_status |= (1 << i);
+        _flowStatus |= (1 << i);
       }
       else
       {
@@ -348,11 +426,92 @@ void runFlowStateMachine()
 
     if (!anyTriggeredOK)
     {
-      _flow_status = 0x01FF;
+      _flowStatus = 0x01FF;
     }
 
-    _measurement_done = true;
     _flowState = FLOW_IDLE;
+    break;
+  }
+  }
+}
+
+void startPurgeMeasurement()
+{
+  _purgeStatus = STATUS_UNINIT;
+
+  for (int i = 0; i < NUM_FLAUTAS; i++)
+  {
+    _purgePinDone[i] = false;
+    _purgeSwitchTime[i] = 0;
+  }
+}
+
+// ============================================================
+//  Purge state machine — called every loop().
+//
+//  After StopAll the pump stops. Reservoirs drain through the
+//  purge outlets. Each flauta pin is LOW while the reservoir
+//  is full (level switch triggered). As it drains the pin
+//  goes HIGH (level switch released = liquid level dropped).
+//
+//  PURGE_RUNNING : polls all pending pins each loop() call.
+//                  Records elapsed ms when pin goes HIGH.
+//                  Exits when all done or _purgeTimeMax elapsed.
+//  PURGE_DONE    : evaluates results once, sets _purgeStatus,
+//                  transitions to PURGE_IDLE.
+// ============================================================
+void runPurgeStateMachine()
+{
+  switch (_purgeState)
+  {
+  case PURGE_IDLE:
+    break;
+
+  case PURGE_RUNNING:
+  {
+    unsigned long elapsed = millis() - _purgeStartTime;
+    bool allDone = true;
+
+    for (int i = 0; i < NUM_FLAUTAS; i++)
+    {
+      if (!_purgePinDone[i])
+      {
+        if (digitalRead(FLT_PINS[i]) == HIGH)
+        {
+          _purgeSwitchTime[i] = elapsed;
+          _purgePinDone[i] = true;
+        }
+        else
+        {
+          allDone = false;
+        }
+      }
+    }
+
+    if (allDone || elapsed >= _purgeTimeMax)
+    {
+      _purgeState = PURGE_DONE;
+    }
+
+    break;
+  }
+  case PURGE_DONE:
+  {
+    _purgeStatus = 0x0000;
+
+    for (int i = 0; i < NUM_FLAUTAS; i++)
+    {
+      if (!_purgePinDone[i])
+      {
+        _purgeStatus |= (1 << i);
+      }
+      else if (_purgeSwitchTime[i] < _purgeTimeMin)
+      {
+        _purgeStatus |= (1 << i);
+      }
+    }
+
+    _purgeState = PURGE_IDLE;
     break;
   }
   }
@@ -360,34 +519,40 @@ void runFlowStateMachine()
 
 void sendData()
 {
-  if (_flowState != FLOW_IDLE)
+  if (isBusy())
   {
     Serial.print("BUSY\r\n");
     return;
   }
 
-  if (!_measurement_done)
-  {
-    Serial.print("NODATA\r\n");
-  }
-
-  if (_temperature <= -98.0)
-  {
-    Serial.print("ERR");
-  }
-  else
-  {
-    Serial.print(_temperature, 1);
-  }
-
   char buf[5];
-  Serial.print(",");
-  sprintf(buf, "%04x", _clog_status);
+
+  sprintf(buf, "%02d", _device_id);
   Serial.print(buf);
 
   Serial.print(",");
-  sprintf(buf, "%04x", _flow_status);
-  Serial.print(buf);
+  Serial.print(_op_mode);
+
+  Serial.print(",");
+  if (_temperature <= -98.0)
+    Serial.print("ERR");
+  else
+    Serial.print(_temperature, 1);
+
+  if (_op_mode == 1)
+  {
+    Serial.print(",");
+    sprintf(buf, "%04x", _clogStatus);
+    Serial.print(buf);
+
+    Serial.print(",");
+    sprintf(buf, "%04x", _flowStatus);
+    Serial.print(buf);
+
+    Serial.print(",");
+    sprintf(buf, "%04x", _purgeStatus);
+    Serial.print(buf);
+  }
 
   Serial.print("\r\n");
 }
