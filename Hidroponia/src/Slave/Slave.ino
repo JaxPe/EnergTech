@@ -517,6 +517,10 @@ void runPurgeStateMachine()
   }
 }
 
+// ============================================================
+// Saída de dados
+// ID,modo,temperatura,statusEntupimento,statusVazão,statusPurga
+// ============================================================
 void sendData()
 {
   if (isBusy())
