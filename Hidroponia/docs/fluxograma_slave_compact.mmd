@@ -1,0 +1,60 @@
+%%{init: {'flowchart': {'htmlLabels': true, 'curve': 'linear'}, 'fontSize': 16, 'fontFamily': 'Arial', 'primaryColor': '#ffffff', 'primaryBorderColor': '#000000', 'mainConfig': {'layout': 'elk', 'elk': {'algorithm': 'mrtree'}}}}%%
+flowchart TD
+  Start([POWER ON]) --> Setup["<b>SETUP</b><br/>Inicialização"]
+  Setup --> Loop(["<b>LOOP</b>"])
+
+  Loop --> ReadSerial["<b>Serial</b>"]
+  Loop --> FlowSM["<b>Vazão</b>"]
+  Loop --> PurgeSM["<b>Purga</b>"]
+  Loop --> TempSample["<b>Temperatura</b>"]
+
+    
+  subgraph Temp["TEMPERATURE SAMPLING"]
+    T_CHECK{Time?}
+    T_FILTER["Filtro de Outlier"]
+    T_UPDATE["Read DS1820"]
+    T_CHECK -->|Sim| T_UPDATE
+    T_UPDATE --> T_FILTER
+  end
+  TempSample --> Temp
+
+  subgraph Purge["PURGE STATE MACHINE"]
+    P_IDLE(["IDLE"])
+    P_RUN(["RUNNING"])
+    P_IDLE -->|inicia| P_RUN
+    P_RUN -->|finalizado| P_IDLE
+  end
+  PurgeSM --> Purge
+
+  subgraph Flow["FLOW STATE MACHINE"]
+    F_IDLE(["IDLE"])
+    F_CLOG(["CLOG CHECK"])
+    F_RUN(["RUNNING"])
+    F_IDLE -->|inicia| F_CLOG
+    F_CLOG -->|entupido| F_IDLE
+    F_CLOG -->|ok| F_RUN
+    F_RUN -->|finalizado| F_IDLE
+  end
+  FlowSM --> Flow
+
+  subgraph Serial["SERIAL COMMANDS"]
+    SC2{Comando?}
+    SC2 -->|StartAll| SC_Start["Vazão ON"]
+    SC2 -->|StopAll| SC_Stop["Purga ON"]
+    SC2 -->|Send| SC_Send["Envia dados"]
+    SC2 -->|Config| SC_Config["Ajusta Parametros"]
+  end
+  ReadSerial --> Serial
+
+  subgraph Send["SEND OUTPUT"]
+    SD_OUT["ID,Mode,Temp,StatusEntupimento,StatusVazão,StatusPurga"]
+  end
+  SC_Send --> Send
+
+  classDef setup fill:#90EE90,stroke:#228B22,stroke-width:3px,font-size:16px;
+  classDef active fill:#87CEEB,stroke:#00008B,stroke-width:2px,font-size:16px;
+  classDef output fill:#FFE4B5,stroke:#FF8C00,stroke-width:2px,font-size:15px;
+
+  class Start,Setup setup;
+  class Loop,Serial,Flow,Purge,Temp active;
+  class Send output;
