@@ -1,7 +1,7 @@
 // ============================================================
 //  SLAVE
 //  Hardware: Arduino NANO
-//  Rev: E  |  Date: 2026-03-30
+//  Rev: F  |  Date: 2026-05-13
 //
 //  MAPEAMENTO DE CONEXÕES (apartir da esquemática V6):
 //    D2  (05) - OneWire DS18B20 sensor temperatura
@@ -13,6 +13,8 @@
 //    D8  (11) - FLT 6
 //    D9  (12) - FLT 7
 //    D10 (13) - FLT 8
+//    D11 (01) - conversor RS485 TXD
+//    D12 (02) - conversor RS485 RXD
 //    D13 (14) - FLT 9
 //    A0  (19) - ENDEREÇO bit 0
 //    A1  (20) - ENDEREÇO bit 1
@@ -20,23 +22,25 @@
 //    A3  (22) - ENDEREÇO bit 3
 //    A4  (23) - ENDEREÇO bit 4
 //    A5  (24) - MODO DE OPERAÇÃO (open=full, shorted=temp only)
-//    TX  (01) - conversor RS485 TXD
-//    RX  (02) - conversor RS485 RXD
 //
 //  MODOS OPERACIONAIS (DIP switch A5 / MOD OP):
-//    0 = Full: medição de vazão (9 flautas) + temperatura
-//    1 = Somente temperatura
+//    1 = Full: medição de vazão (9 flautas) + temperatura
+//    0 = Somente temperatura
 //
 //  COMANDOS (RS485 bus, <CR>):
-//    READ A<CR>        - TODOS os dispositivos executam a rotina de medição de vazão
-//    SEND <addr><CR>   - dispositivo <addr> envia temperatura + flow data
-//    Tmax <val><CR>    - Define janela de tempo máxima para medição de vazão (ms)  Default: 2000
-//    Tmin <val><CR>    - Define tempo mínimo para vazão (ms)                       Default: 500
-//    TRATE <val><CR>   - Define amostras de temperatura por minuto (padrão = 12)
+//    StartAll<CR>              - TODOS os dispositivos executam a rotina de medição de vazão
+//    StopAll<CR>               - TODOS os dispositivos executam a rotina de medição de purga
+//    SEND <addr><CR>           - dispositivo <addr> envia string de dados
+//    TimeVMax <val><CR>        - Define janela de tempo para medição de vazão (ms)  Default: 2000
+//    TimeVMin <val><CR>        - Define tempo mínimo para vazão (ms)                       Default: 500
+//    TimePMax <Val><CR>        - Define janela de tempo para medição de purga (ms)
+//    TimePMin <val><CR>        - Define tempo mínimo para purga (ms)
+//    TempRate <val><CR>        - Define amostras de temperatura por minuto (padrão = 12)
+//    TempAdj <addr><val><CR>   - Define variável de ajuste do sensor de temperatura
 //
 //  RESPOSTA para "SEND <addr>":
-//    <temperatura>,<obstruido_HEX>,<vazao_HEX><CR><LF>
-//    Example:  22.50,01FF,0000
+//    <id>,<op_mode>,<temperatura>,<entupimento_HEX>,<vazao_HEX>,<purga_HEX><CR><LF>
+//    Example:  22.50,01FF,0000,01FF
 //
 //    obstruido_HEX (16-bit):
 //      posição do Bit = número da flauta (0=FLT1 ... 8=FLT9)
@@ -45,8 +49,13 @@
 //
 //    vazao_HEX (16-bit):
 //      posição do Bit = número da flauta (0=FLT1 ... 8=FLT9)
-//      Bit 1 = vazao BAIXA (não acionou dentro do Tmax)
-//      Bit 0 = vazao OK
+//      Bit 1 = vazao de entrada BAIXA (não acionou dentro do Tmax)
+//      Bit 0 = vazao de entrada OK
+//
+//    purga_HEX (16-bit):
+//      posição do Bit = número da flauta (0=FLT1 ... 8=FLT9)
+//      Bit 1 = vazao de purga BAIXA (não desacionou dentro do Tmax)
+//      Bit 0 = vazao de purga OK
 //
 //  TEMPERATURA:
 //    Amostras coletadas continuamente em backgroun em uma frequencia de TRATE por segundo.
@@ -83,7 +92,9 @@ const uint8_t FLT_PINS[NUM_FLAUTAS] = {3, 4, 5, 6, 7, 8, 9, 10, 13};
 #define TEMP_MAX_DELTA 2.0f // °C - descarta leituras fora desta margem
 #define DEFAULT_TEMP_ADJ 0.0f
 
-#define STATUS_UNINIT 0xFFF
+#define STATUS_UNINIT 0xFFFF
+
+#define RX_TIMEOUT_ms 100
 
 OneWire oneWire(TEMP_PIN);
 DallasTemperature tempSensor(&oneWire);
@@ -92,7 +103,7 @@ DeviceAddress tempAddress;
 SoftwareSerial masterSerial(12, 11);
 
 int _device_id = 0;
-int _op_mode = 0; // 0=completo, 1=temp somente
+int _op_mode = 0; // 1=completo, 0=temp somente
 
 // Tempo de vazão
 unsigned long _flowTimeMax = DEFAULT_FLOW_TIME_MAX;
@@ -150,12 +161,32 @@ unsigned long _purgeSwitchTime[NUM_FLAUTAS] = {0};
 
 // Buffer de serial recebido
 String _rxBuffer = "";
+unsigned long _rxLastCharTime = 0;
 
+/**
+ * @brief Verifica se o dispositivo está executando medições.
+ *
+ * @return true se a medição de vazão ou purga estiver em progresso
+ * @return false se o dispositivo estiver ocioso e pronto para novos comandos
+ */
 bool isBusy()
 {
   return _flowState != FLOW_IDLE || _purgeState != PURGE_IDLE;
 }
 
+/**
+ * @brief Inicializa o hardware, configura os pinos, comunicação serial e sensor de temperatura.
+ *
+ * Configura:
+ * - Pinos de seleção de endereço (A0-A4) como entradas com pull-ups do interruptor DIP
+ * - Pino de modo de operação (A5) como entrada com pull-up
+ * - Todos os 9 pinos de sensor de flauta (D3-D13) como entradas com pull-ups
+ * - Sensor de temperatura OneWire no pino D2
+ * - Comunicação serial em 9600 baud (debug e comunicação com mestre)
+ * - Lê o endereço do dispositivo da configuração do interruptor DIP
+ * - Lê o modo de operação do pino MODE_PIN
+ * - Inicializa o buffer de temperatura com leituras iniciais
+ */
 void setup()
 {
   pinMode(ADDR_PIN_0, INPUT_PULLUP);
@@ -185,6 +216,15 @@ void setup()
   initTemperatureBuffer();
 }
 
+/**
+ * @brief Loop principal - monitora e atualiza continuamente todos os subsistemas.
+ *
+ * Executa em sequência a cada iteração:
+ * 1. Processa comandos recebidos do mestre via RS485
+ * 2. Atualiza a máquina de estados de medição de vazão
+ * 3. Atualiza a máquina de estados de medição de purga
+ * 4. Amostra a temperatura em taxa configurada (em background)
+ */
 void loop()
 {
   readSerialCommands();
@@ -193,7 +233,15 @@ void loop()
   sampleTemperatureContinuous();
 }
 
-// Lê endereço 5-bit do DIP switch (A0-A4)
+/**
+ * @brief Lê o endereço de 5 bits do dispositivo a partir da configuração do interruptor DIP.
+ *
+ * O endereço é definido via interruptor DIP de 5 posições nos pinos A0-A4 (MSB para LSB).
+ * Cada interruptor: BAIXO (fechado) = 1, ALTO (aberto) = 0
+ * Permite até 32 endereços únicos (0-31) no barramento RS485.
+ *
+ * @return int Endereço do dispositivo (0-31) baseado nas posições do interruptor DIP
+ */
 int readAddress()
 {
   int b0 = !digitalRead(ADDR_PIN_4);
@@ -204,12 +252,29 @@ int readAddress()
   return b0 + (b1 << 1) + (b2 << 2) + (b3 << 3) + (b4 << 4);
 }
 
-// Acumula caracteres do RS485 até <CR>
+/**
+ * @brief Lê dados de série recebidos e processa comandos terminados por retorno de carro.
+ *
+ * Acumula caracteres do barramento RS485 em um buffer. Quando um retorno de carro (\r)
+ * é recebido, a string de comando completa é passada para handleCommand() para processamento.
+ * Quebras de linha (\n) são ignoradas. A saída de debug por eco é enviada para caracteres recebidos.
+ */
 void readSerialCommands()
 {
-  while (Serial.available() > 0)
+  unsigned long now = millis();
+
+  if (_rxBuffer.length() > 0 && (now - _rxLastCharTime) >= RX_TIMEOUT_ms)
   {
-    char c = (char)Serial.read();
+    Serial.print("Descartando (timeout): ");
+    Serial.println(_rxBuffer);
+    _rxBuffer = "";
+  }
+
+  while (masterSerial.available() > 0)
+  {
+    char c = (char)masterSerial.read();
+    _rxLastCharTime = millis();
+
     if (c == '\r')
     {
       _rxBuffer.trim();
@@ -224,14 +289,23 @@ void readSerialCommands()
       _rxBuffer += c;
       Serial.println(_rxBuffer);
     }
-    else if (c == '\n')
-    {
-      _rxBuffer = "";
-    }
   }
 }
 
-// lida com os comandos
+/**
+ * @brief Analisa e executa comandos recebidos do dispositivo mestre via RS485.
+ *
+ * Comandos suportados:
+ * - "StartAll" - Inicia ciclo de medição de vazão
+ * - "StopAll" - Inicia ciclo de medição de purga
+ * - "Send <addr>" - Envia dados de medição se endereço corresponder
+ * - "TimeVMax <ms>" - Define janela de medição de vazão
+ * - "TimeVMin <ms>" - Define tempo mínimo de detecção de vazão
+ * - "TimePMax <ms>" - Define janela de medição de purga
+ * - "TimePMin <ms>" - Define tempo mínimo de detecção de purga
+ * - "TempRate <amostras/min>" - Define frequência de amostragem de temperatura
+ * - "TempAdj <addr> <offset>" - Define offset de calibração do sensor de temperatura
+ */
 void handleCommand(String cmd)
 {
   if (cmd == "StartAll")
@@ -241,6 +315,7 @@ void handleCommand(String cmd)
   }
   else if (cmd == "StopAll")
   {
+    Serial.println("Stop");
     startPurgeMeasurement();
   }
 
@@ -274,7 +349,7 @@ void handleCommand(String cmd)
   }
   else if (cmd.startsWith("TempRate "))
   {
-    unsigned long rate = (unsigned long)cmd.substring(6).toInt();
+    unsigned long rate = (unsigned long)cmd.substring(9).toInt();
     if (rate > 0)
     {
       _tempSampleRate = rate;
@@ -285,17 +360,30 @@ void handleCommand(String cmd)
   }
   else if (cmd.startsWith("TempAdj "))
   {
-    int addr = cmd.substring(9).toInt();
+    int addr = cmd.substring(8).toInt();
     if (addr == _device_id)
     {
-      float adjust = (float)cmd.substring(11).toFloat();
+      float adjust = (float)cmd.substring(10).toFloat();
       _tempAdj = adjust;
     }
+    Serial.print("TempAdj: ");
+    Serial.println(_tempAdj);
   }
 }
 
-// Inicia a medição da vazão - acionado por "StartAll".
-// Reseta entupimento + vazão e inicia a máquina de estado de vazão
+/**
+ * @brief Inicia o ciclo de medição de vazão acionado pelo comando "StartAll".
+ *
+ * Redefine todos os registros de status relacionados com vazão e variáveis de estado,
+ * depois faz a transição da máquina de estados para a fase FLOW_CLOG_CHECK.
+ * Este é o ponto de entrada para medir as taxas de fluxo de água através de cada flauta
+ * (saída de gotejamento de flor).
+ *
+ * Define valores de status inicial:
+ * - _clogStatus redefinido para 0xFFFF (assume todas as saídas desentupidas)
+ * - _flowStatus redefinido para 0x0000 (sem vazão detectada ainda)
+ * - Todas as variáveis de rastreamento por flauta limpas
+ */
 void startFlowMeasurement()
 {
   _clogStatus = 0xFFFF;
@@ -311,19 +399,33 @@ void startFlowMeasurement()
   _flowState = FLOW_CLOG_CHECK;
 }
 
-// ============================================================
-//  Flow state machine — called every loop().
-//
-//  FLOW_CLOG_CHECK : reads all pins once.
-//                    LOW at start = clogged outlet (bit=0 in clogStatus).
-//                    HIGH at start = outlet OK (bit=1 in clogStatus).
-//                    Aborts to FLOW_IDLE if all clogged.
-//  FLOW_RUNNING    : polls pending pins each loop() call.
-//                    Records elapsed ms when pin goes LOW.
-//                    Exits when all done or _flowTimeMax elapsed.
-//  FLOW_DONE       : evaluates results once, sets _flowStatus,
-//                    transitions to FLOW_IDLE.
-// ============================================================
+/**
+ * @brief Máquina de estados que controla o ciclo de medição de vazão.
+ *
+ * Funciona em três fases:
+ *
+ * **FLOW_CLOG_CHECK**: Verificação inicial de saída
+ * - Lê todos os 9 pinos de flauta uma vez para detectar saídas entupidas
+ * - Se o pino for BAIXO = saída entupida (flauta fechada, bloqueada)
+ * - Se o pino for ALTO = saída OK (flauta aberta, limpa)
+ * - Armazena status de entupimento em _clogStatus (1=OK, 0=entupido)
+ * - Se todas as 9 saídas estão entupidas, aborta medição para FLOW_IDLE
+ * - Se todas passam ou op_mode=0 (temperatura apenas), transição para FLOW_IDLE
+ * - Caso contrário move para FLOW_RUNNING
+ *
+ * **FLOW_RUNNING**: Medir tempo de ativação
+ * - Pesquisa continuamente pinos esperando que fiquem BAIXOS (água fluindo)
+ * - Quando BAIXO detectado, registra milissegundos decorridos desde o início
+ * - Continua até que todos os pinos tenham se ativado OU tempo limite (_flowTimeMax) atingido
+ * - Transição para FLOW_DONE quando completo
+ *
+ * **FLOW_DONE**: Avaliar e armazenar resultados
+ * - Analisa tempos de ativação armazenados contra limiar mínimo (_flowTimeMin)
+ * - Define bits de _flowStatus: 1=vazão OK, 0=problema de vazão (muito lento ou nunca acionado)
+ * - Transição de volta para FLOW_IDLE
+ *
+ * Chamado a cada iteração do main loop().
+ */
 void runFlowStateMachine()
 {
   switch (_flowState)
@@ -332,6 +434,7 @@ void runFlowStateMachine()
     break;
   case FLOW_CLOG_CHECK:
   {
+    Serial.println("Checking");
     _clogStatus = 0x0000;
     int clogCount = 0;
 
@@ -363,7 +466,7 @@ void runFlowStateMachine()
     {
       _flowStartTime = millis();
       _flowState = FLOW_RUNNING;
-      Serial.println("sem entupimento");
+      Serial.println("sem entupimento total");
     }
     break;
   }
@@ -381,7 +484,8 @@ void runFlowStateMachine()
         {
           _flowSwitchTime[i] = elapsed;
           _flowPinDone[i] = true;
-          Serial.println("ativou");
+          Serial.print(i);
+          Serial.println(" ativou");
         }
         else
         {
@@ -435,6 +539,15 @@ void runFlowStateMachine()
   }
 }
 
+/**
+ * @brief Inicia o ciclo de medição de purga acionado pelo comando "StopAll".
+ *
+ * Quando a bomba para após medição de vazão, água residual drena através das saídas de purga.
+ * Esta função redefine variáveis de rastreamento de purga e começa a monitorar quanto tempo leva
+ * para cada flauta drenagem completamente via saída de purga.
+ *
+ * Define status inicial como STATUS_UNINIT e limpa rastreamento de purga por flauta.
+ */
 void startPurgeMeasurement()
 {
   _purgeStatus = STATUS_UNINIT;
@@ -444,22 +557,33 @@ void startPurgeMeasurement()
     _purgePinDone[i] = false;
     _purgeSwitchTime[i] = 0;
   }
+
+  _purgeStartTime = millis();
+  _purgeState = PURGE_RUNNING;
 }
 
-// ============================================================
-//  Purge state machine — called every loop().
-//
-//  After StopAll the pump stops. Reservoirs drain through the
-//  purge outlets. Each flauta pin is LOW while the reservoir
-//  is full (level switch triggered). As it drains the pin
-//  goes HIGH (level switch released = liquid level dropped).
-//
-//  PURGE_RUNNING : polls all pending pins each loop() call.
-//                  Records elapsed ms when pin goes HIGH.
-//                  Exits when all done or _purgeTimeMax elapsed.
-//  PURGE_DONE    : evaluates results once, sets _purgeStatus,
-//                  transitions to PURGE_IDLE.
-// ============================================================
+/**
+ * @brief Máquina de estados que controla o ciclo de medição de purga de drenagem.
+ *
+ * Depois que a bomba para, líquido residual em cada reservatório de flauta drena através de uma saída de purga.
+ * Isto monitora tempo de drenagem para detectar bloqueios ou anomalias do sistema.
+ *
+ * **PURGE_RUNNING**: Medir tempo de drenagem de reservatório
+ * - Pesquisa continuamente todos os 9 pinos de flauta procurando transição para ALTO
+ * - Cada flauta tem um interruptor de nível que dispara BAIXO quando reservatório está cheio
+ * - À medida que líquido drena, nível cai e pino vai para ALTO (interruptor de nível libera)
+ * - Registra ms decorridos desde parada de bomba até transição para ALTO para cada flauta
+ * - Continua até que todos os reservatórios estejam vazios OU tempo limite (_purgeTimeMax) atingido
+ * - Transição para PURGE_DONE quando completo
+ *
+ * **PURGE_DONE**: Avaliar desempenho de drenagem
+ * - Para cada flauta que drenou, verifica se tempo excede limiar mínimo (_purgeTimeMin)
+ * - Se drenagem muito lenta ou nunca ocorreu, define bit de erro em _purgeStatus
+ * - Define bits de _purgeStatus: 1=problema de drenagem/timeout, 0=drenou OK
+ * - Transição de volta para PURGE_IDLE
+ *
+ * Chamado a cada iteração do main loop().
+ */
 void runPurgeStateMachine()
 {
   switch (_purgeState)
@@ -517,10 +641,24 @@ void runPurgeStateMachine()
   }
 }
 
-// ============================================================
-// Saída de dados
-// ID,modo,temperatura,statusEntupimento,statusVazão,statusPurga
-// ============================================================
+/**
+ * @brief Transmite dados de medição para o dispositivo mestre via RS485.
+ *
+ * Envia string de dados formatada contendo ID, modo de operação, temperatura e resultados de medição.
+ * Formato: ID,MODO,TEMP[,HEX_ENTUPIMENTO,HEX_VAZAO,HEX_PURGA]\r\n
+ *
+ * Exemplo de saída (Modo completo):
+ *   22,1,25.3,01FF,0000,01FF\r\n
+ * Exemplo de saída (Modo temperatura apenas):
+ *   22,0,25.3\r\n
+ *
+ * Recusa enviar se dispositivo está ocupado (medições em progresso).
+ * No modo temperatura apenas, envia apenas ID, modo e temperatura.
+ * No modo completo, também inclui três palavras de status de 16-bit:
+ *   - HEX_ENTUPIMENTO: Status de entupimento de saída (bit por flauta, 1=OK, 0=entupido)
+ *   - HEX_VAZAO: Resultados de medição de vazão (bit por flauta, 1=problema, 0=OK)
+ *   - HEX_PURGA: Resultados de drenagem de purga (bit por flauta, 1=problema, 0=OK)
+ */
 void sendData()
 {
   if (isBusy())
@@ -532,35 +670,44 @@ void sendData()
   char buf[5];
 
   sprintf(buf, "%02d", _device_id);
-  Serial.print(buf);
+  masterSerial.print(buf);
 
-  Serial.print(",");
-  Serial.print(_op_mode);
+  masterSerial.print(",");
+  masterSerial.print(_op_mode);
 
-  Serial.print(",");
+  masterSerial.print(",");
   if (_temperature <= -98.0)
-    Serial.print("ERR");
+    masterSerial.print("ERR");
   else
-    Serial.print(_temperature, 1);
+    masterSerial.print(_temperature, 1);
 
   if (_op_mode == 1)
   {
-    Serial.print(",");
+    masterSerial.print(",");
     sprintf(buf, "%04x", _clogStatus);
-    Serial.print(buf);
+    masterSerial.print(buf);
 
-    Serial.print(",");
+    masterSerial.print(",");
     sprintf(buf, "%04x", _flowStatus);
-    Serial.print(buf);
+    masterSerial.print(buf);
 
-    Serial.print(",");
+    masterSerial.print(",");
     sprintf(buf, "%04x", _purgeStatus);
-    Serial.print(buf);
+    masterSerial.print(buf);
   }
 
-  Serial.print("\r\n");
+  masterSerial.print("\r\n");
 }
 
+/**
+ * @brief Verifica se é hora de amostrar temperatura e dispara atualização se necessário.
+ *
+ * Esta função implementa amostragem periódica não-bloqueante na taxa configurada
+ * (_tempSampleRate, padrão 30 amostras/minuto = a cada 2 segundos).
+ * Usa comparação de tempo decorrido em vez de atrasos bloqueadores.
+ *
+ * Chamado a cada iteração de loop mas realiza medições reais apenas nos limites de intervalo.
+ */
 void sampleTemperatureContinuous()
 {
   unsigned long now = millis();
@@ -571,6 +718,21 @@ void sampleTemperatureContinuous()
   }
 }
 
+/**
+ * @brief Lê a temperatura atual do sensor DS18B20 e atualiza a média móvel.
+ *
+ * Implementa filtro de média móvel com rejeição de valores discrepantes:
+ * 1. Solicita conversão de temperatura ao sensor
+ * 2. Recupera leitura de temperatura bruta em °C
+ * 3. Compara contra média móvel:
+ *    - Se desvio > TEMP_MAX_DELTA (2°C), leitura é rejeitada como valor discrepante
+ *    - Caso contrário, leitura é adicionada ao buffer circular
+ * 4. Atualiza _temperature com nova média das últimas N leituras
+ *
+ * Tamanho do buffer: TEMP_AVG_SIZE (10 amostras)
+ * Filtro rejeita ruído do sensor e transientes térmicos
+ * Se sensor não é detectado, define _temperature para -99.0 (indicador de erro)
+ */
 void updateTemperature()
 {
   tempSensor.requestTemperatures();
@@ -598,9 +760,17 @@ void updateTemperature()
   {
     _tempCount++;
   }
-  _temperature = computeAverage();
+  _temperature = computeAverage() + _tempAdj;
 }
 
+/**
+ * @brief Calcula a média aritmética das leituras de temperatura armazenadas em buffer.
+ *
+ * Computa média de todas as leituras válidas atualmente no buffer circular.
+ * Usada pelo filtro de rejeição de valores discrepantes e reportada na saída de dados do sensor.
+ *
+ * @return float Temperatura média em °C, ou 0.0 se buffer está vazio
+ */
 float computeAverage()
 {
   if (_tempCount == 0)
@@ -615,6 +785,16 @@ float computeAverage()
   return sum / _tempCount;
 }
 
+/**
+ * @brief Inicializa o buffer de temperatura com leituras iniciais do sensor na inicialização.
+ *
+ * Lê o sensor DS18B20 e preenche todo o buffer circular com a mesma leitura inicial.
+ * Isto permite que o filtro de detecção de valores discrepantes funcione corretamente
+ * a partir da primeira medição estabelecendo uma linha de base válida e média.
+ *
+ * Chamado durante setup() para garantir que medições de temperatura estejam disponíveis
+ * imediatamente após boot (sem período de aquecimento necessário).
+ */
 void initTemperatureBuffer()
 {
   tempSensor.requestTemperatures();

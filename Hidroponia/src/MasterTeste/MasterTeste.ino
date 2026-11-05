@@ -1,94 +1,74 @@
-#include <SoftwareSerial.h>
+#include <Arduino.h>
 
-SoftwareSerial slaveSerial(5, 6);
+#define DEBUG_SERIAL Serial
+#define RS485_SERIAL Serial1
 
-unsigned long lastActionTime = 0;
-const long pollingInterval = 2000;
-const long responseTimeout = 1000;
+// Se o módulo RS485 tiver pino DE/RE, descomente e configure o pino correto.
+// #define RS485_DE_RE_PIN 2
 
-const int totalSlaves = 2;
-int currentSlave = 1;
-bool awaitingResponse = false;
+void setRs485Tx()
+{
+#ifdef RS485_DE_RE_PIN
+  digitalWrite(RS485_DE_RE_PIN, HIGH);
+#endif
+}
+
+void setRs485Rx()
+{
+#ifdef RS485_DE_RE_PIN
+  digitalWrite(RS485_DE_RE_PIN, LOW);
+#endif
+}
 
 void setup()
 {
-  Serial.begin(9600);
-  slaveSerial.begin(9600);
-  Serial.println("Master Inicializado");
+  DEBUG_SERIAL.begin(9600);
+  RS485_SERIAL.begin(9600);
+
+#ifdef RS485_DE_RE_PIN
+  pinMode(RS485_DE_RE_PIN, OUTPUT);
+  setRs485Rx();
+#endif
+
+  DEBUG_SERIAL.println("MasterTeste pronto.");
+  DEBUG_SERIAL.println("Use o monitor serial para enviar comandos.");
+  DEBUG_SERIAL.println("Exemplos:");
+  DEBUG_SERIAL.println("  Send 4");
+  DEBUG_SERIAL.println("  StartAll");
+  DEBUG_SERIAL.println("  StopAll");
+  DEBUG_SERIAL.println("  TimeVMax 2000");
+  DEBUG_SERIAL.println("-----------------------------");
 }
 
 void loop()
 {
-  unsigned long currentTime = millis();
-
-  if (!awaitingResponse && (currentTime - lastActionTime >= pollingInterval))
+  if (DEBUG_SERIAL.available() > 0)
   {
-    sendRequest();
-  }
-  if (awaitingResponse && slaveSerial.available() > 0)
-  {
-    handleResponse();
-  }
-  if (awaitingResponse && (currentTime - lastActionTime >= responseTimeout))
-  {
-    handleTimeout();
-  }
-}
+    String cmd = DEBUG_SERIAL.readStringUntil('\n');
+    cmd.trim();
 
-void sendRequest()
-{
-  lastActionTime = millis();
-  awaitingResponse = true;
+    if (cmd.length() > 0)
+    {
+      DEBUG_SERIAL.print("-> Enviando: ");
+      DEBUG_SERIAL.println(cmd);
 
-  Serial.print("\n[POLLING] Slave ");
-  Serial.print(currentSlave);
-
-  slaveSerial.print("Send ");
-  slaveSerial.print(currentSlave);
-  slaveSerial.print("\r");
-}
-
-void handleResponse()
-{
-  String rawData = slaveSerial.readStringUntil('\n');
-  rawData.trim();
-
-  int rxId;
-  float rxTemp, rxHum;
-
-  int fields = sscanf(rawData.c_str(), "%d,%f,%f", &rxId, &rxTemp, &rxHum);
-
-  if (fields == 3 && rxId == currentSlave)
-  {
-    Serial.print(" -> SUCCESS: ");
-    Serial.print("T:");
-    Serial.print(rxTemp);
-    Serial.print(" H:");
-    Serial.println(rxHum);
-  }
-  else
-  {
-    Serial.print(" -> DATA ERROR: Received invalid format or wrong ID: ");
-    Serial.println(rawData);
+      setRs485Tx();
+      RS485_SERIAL.print(cmd);
+      RS485_SERIAL.print("\r");
+      delay(20);
+      setRs485Rx();
+    }
   }
 
-  finishCycle();
-}
-
-void handleTimeout()
-{
-  Serial.println(" -> TIMEOUT: Slave failed to respond.");
-  finishCycle();
-}
-
-void finishCycle()
-{
-  awaitingResponse = false;
-  lastActionTime = millis();
-
-  currentSlave++;
-  if (currentSlave > totalSlaves)
+  if (RS485_SERIAL.available() > 0)
   {
-    currentSlave = 1;
+    String response = RS485_SERIAL.readStringUntil('\n');
+    response.trim();
+
+    if (response.length() > 0)
+    {
+      DEBUG_SERIAL.print("<- Resposta: ");
+      DEBUG_SERIAL.println(response);
+    }
   }
 }
