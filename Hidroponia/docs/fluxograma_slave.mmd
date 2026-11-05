@@ -1,0 +1,106 @@
+flowchart TD
+  Start([Power ON / Reset])
+  subgraph Setup["Setup/Inicialização"]
+    S1[Configura pinos A0-A5 como INPUT_PULLUP]
+    S2[Configura FLT_PINS como INPUT_PULLUP]
+    S3[Inicia OneWire e DallasTemperature]
+    S4[Serial.begin e masterSerial.begin]
+    S5["_device_id = readAddress()"]
+    S6["_op_mode = digitalRead(MODE_PIN)"]
+    S7[initTemperatureBuffer]
+    S8[Imprime Endereço e Modo no Serial]
+  end
+
+  Start --> Setup
+  Setup --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8
+
+  subgraph MainLoop["loop - iteração contínua"]
+    ML1[readSerialCommands]
+    ML2[runFlowStateMachine]
+    ML3[runPurgeStateMachine]
+    ML4[sampleTemperatureContinuous]
+  end
+
+  S8 --> MainLoop
+  MainLoop --> ML1 --> ML2 --> ML3 --> ML4 --> MainLoop
+
+  subgraph Serial["readSerialCommands / handleCommand"]
+    SC1[Acumula chars até CR em _rxBuffer]
+    SC2{comando válido?}
+    SC3[handleCommand]
+    SC4["Suporta: StartAll, StopAll, Send<br/>Send, TimeVMax, TimeVMin, TempRate, TempAdj"]
+    SC5[Send addr - envia dados se addr correto]
+    SC6[StartAll - inicia medição de vazão]
+    SC7[StopAll - inicia purga]
+    SC8[TempRate - atualiza taxa de amostragem]
+  end
+
+  ML1 --> SC1 --> SC2
+  SC2 -->|sim| SC3 --> SC4
+  SC4 --> SC5
+  SC4 --> SC6
+  SC4 --> SC7
+  SC4 --> SC8
+
+  subgraph SendData["sendData()"]
+    SD1{Sistema ocupado?}
+    SD2[BUSY - retorna]
+    SD3[Formata ID]
+    SD4[Imprime dados]
+    SD5[Imprime status em HEX]
+    SD6[Nova linha]
+  end
+
+  SC5 --> SendData
+  SendData --> SD1
+  SD1 -->|sim| SD2
+  SD1 -->|não| SD3 --> SD4 --> SD5 --> SD6
+
+  subgraph Temp["Amostragem de Temperatura"]
+    T1[Calcula intervalo de amostragem]
+    T2{Tempo de amostrar?}
+    T3[updateTemperature]
+    T4[Lê sensor DS1820]
+    T5{Buffer cheio?}
+    T6[Calcula média]
+    T7{Delta aceitável?}
+    T8[Descarta outlier]
+    T9[Armazena no buffer]
+    T10[Atualiza _temperature]
+  end
+
+  ML4 --> T1 --> T2
+  T2 -->|sim| T3 --> T4 --> T5
+  T5 -->|sim| T6 --> T7
+  T7 -->|não| T8
+  T7 -->|sim| T9 --> T10
+  T5 -->|não| T9
+
+  subgraph FlowSM["Flow State Machine"]
+    F0(["FLOW_IDLE"])
+    F1(["FLOW_CLOG_CHECK"])
+    F2(["FLOW_RUNNING"])
+    F3(["FLOW_DONE"])
+  end
+
+  ML2 --> FlowSM
+  F0 -->|StartFlow| F1
+  F1 -->|todos clogged| F0
+  F1 -->|op_mode=0| F0
+  F1 -->|pelo menos 1 ok| F2
+  F2 -->|allDone ou timeout| F3
+  F3 -->|processar resultado| F0
+
+  subgraph PurgeSM["Purge State Machine"]
+    P0(["PURGE_IDLE"])
+    P1(["PURGE_RUNNING"])
+    P2(["PURGE_DONE"])
+  end
+
+  ML3 --> PurgeSM
+  P0 -->|StartPurge| P1
+  P1 -->|allDone ou timeout| P2
+  P2 -->|resultado ok| P0
+
+  classDef note fill:#f9f,stroke:#333,stroke-width:2px;
+  Note1["📋 LEGENDA:<br/>FLT_PINS: D3-D13<br/>TEMP_PIN: D2<br/>DIP A0-A4 endereço<br/>A5 modo operação"]:::note
